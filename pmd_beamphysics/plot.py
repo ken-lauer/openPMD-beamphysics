@@ -287,33 +287,36 @@ def marginal_plot(
     **kwargs,
 ):
     """
-    Density plot and projections
+    Density plot and projections with matplotlib.
 
     Parameters
     ----------
-    particle_group: ParticleGroup
+    particle_group : ParticleGroup
         The object to plot
-    key1: str, default = 't'
+    key1 : str, default = 't'
         Key to bin on the x-axis
-    key2: str, default = 'p'
+    key2 : str, default = 'p'
         Key to bin on the y-axis
-    bins: int, default = None
-       Number of bins. If None, this will use a heuristic: bins = sqrt(n_particle/4)
-    xlim: tuple, default = None
+    bins : int, default = None
+       Number of bins. If None, this will use a heuristic:
+       `bins = sqrt(n_particle/4)`
+    xlim : tuple, default = None
         Manual setting of the x-axis limits.
-    ylim: tuple, default = None
+    ylim : tuple, default = None
         Manual setting of the y-axis limits.
-    tex: bool, default = True
+    tex : bool, default = True
         Use TEX for labels
-    nice: bool, default = True
+    nice : bool, default = True
 
-    ellipse: bool, default = True
+    ellipse : bool, default = True
         If True, plot an ellipse representing the
         2x2 sigma matrix
+    **kwargs :
+        Passed to `plt.figure`.
 
     Returns
     -------
-    fig: matplotlib.figure.Figure
+    matplotlib.figure.Figure
 
     Examples
     --------

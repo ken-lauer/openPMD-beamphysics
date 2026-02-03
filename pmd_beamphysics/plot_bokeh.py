@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import numpy as np
+from bokeh.layouts import gridplot
+from bokeh.models import (
+    ColumnDataSource,
+    GridPlot,
+    LinearColorMapper,
+    ColorBar,
+)
+from bokeh.palettes import Viridis256
+
+from bokeh.plotting import figure
+
+from .labels import mathlabel
+from .plot_base import prepare_marginal_plot
+
+
+def marginal_plot(
+    particle_group,
+    key1: str = "t",
+    key2: str = "p",
+    bins: int | None = None,
+    *,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    nice: bool = True,
+    ellipse: bool = False,
+    width: int = 600,
+    height: int = 600,
+    colorbar: bool = False,
+) -> GridPlot:
+    """
+    Density plot and projections with bokeh.
+
+    Parameters
+    ----------
+    particle_group: ParticleGroup
+        The object to plot
+    key1: str, default = 't'
+        Key to bin on the x-axis
+    key2: str, default = 'p'
+        Key to bin on the y-axis
+    bins: int, default = None
+       Number of bins. If None, this will use a heuristic:
+       `bins = sqrt(n_particle/4)`
+    xlim: tuple, default = None
+        Manual setting of the x-axis limits.
+    ylim: tuple, default = None
+        Manual setting of the y-axis limits.
+    tex: bool, default = True
+        Use TEX for labels
+    nice: bool, default = True
+
+    ellipse: bool, default = True
+        If True, plot an ellipse representing the
+        2x2 sigma matrix
+
+    Returns
+    -------
+    GridPlot
+
+    Examples
+    --------
+
+    >>> P = ParticleGroup("particles.h5")
+    >>> obj = marginal_plot(P, 't', 'energy', bins=200)
+    >>> bokeh.io.save(obj, "t_vs_energy.html")
+    """
+    pdata = prepare_marginal_plot(
+        particle_group,
+        key1=key1,
+        key2=key2,
+        bins=bins,
+        xlim=xlim,
+        ylim=ylim,
+        nice=nice,
+        ellipse=ellipse,
+    )
+
+    labelx = mathlabel(key1, units=pdata.x.full_unit, tex=False).replace("$", "")
+    labely = mathlabel(key2, units=pdata.y.full_unit, tex=False).replace("$", "")
+
+    # Layout Sizes
+    marg_fraction = 0.2
+    main_w = int(width * (1 - marg_fraction))
+    main_h = int(height * (1 - marg_fraction))
+    marg_w = int(width * marg_fraction)
+    marg_h = int(height * marg_fraction)
+
+    # Main Joint Figure
+    fig_joint = figure(
+        width=main_w,
+        height=main_h,
+        x_axis_label=labelx,
+        y_axis_label=labely,
+        x_range=pdata.x.lim,
+        y_range=pdata.y.lim,
+        tools="pan,wheel_zoom,box_zoom,save,reset,hover",
+        toolbar_location="left",
+    )
+
+    if len(pdata.x.data) == 1:
+        fig_joint.scatter(pdata.x.data, pdata.y.data, size=10, color="navy")
+    else:
+        H, xedges, yedges = np.histogram2d(
+            pdata.x.data, pdata.y.data, bins=pdata.bins, weights=pdata.weights
+        )
+        H = H.T
+
+        h_min = np.min(H[H > 0]) if np.any(H > 0) else 0
+        h_max = np.max(H) if np.any(H) else 1
+
+        mapper = LinearColorMapper(palette=Viridis256, low=h_min, high=h_max)
+
+        if colorbar:
+            color_bar = ColorBar(color_mapper=mapper, location=(0, 0))
+            fig_joint.add_layout(color_bar, "left")
+
+        source_img = ColumnDataSource(
+            {
+                "image": [H],
+                "x": [xedges[0]],
+                "y": [yedges[0]],
+                "dw": [xedges[-1] - xedges[0]],
+                "dh": [yedges[-1] - yedges[0]],
+            }
+        )
+
+        fig_joint.image(
+            image="image",
+            x="x",
+            y="y",
+            dw="dw",
+            dh="dh",
+            source=source_img,
+            color_mapper=mapper,
+        )
+
+    if pdata.ellipse_x is not None:
+        fig_joint.line(
+            pdata.ellipse_x, pdata.ellipse_y, color="red", line_width=2, alpha=0.8
+        )
+
+    # Marginal Plots
+
+    # Top (X projection)
+    p_top = figure(
+        width=main_w,
+        height=marg_h,
+        x_range=fig_joint.x_range,
+        y_axis_location="left",
+        min_border=0,
+        outline_line_color=None,
+        tools="",
+    )
+    p_top.vbar(
+        x=pdata.x.hist_centers,
+        top=pdata.x.hist_values,
+        width=pdata.x.hist_width,
+        bottom=0,
+        fill_color="gray",
+        line_color="gray",
+    )
+    p_top.yaxis.axis_label = pdata.x.hist_label_prefix
+    p_top.xaxis.visible = False
+
+    # Right (Y projection)
+    p_right = figure(
+        width=marg_w,
+        height=main_h,
+        y_range=fig_joint.y_range,
+        x_axis_location="below",
+        min_border=0,
+        outline_line_color=None,
+        tools="",
+    )
+    p_right.hbar(
+        y=pdata.y.hist_centers,
+        right=pdata.y.hist_values,
+        height=pdata.y.hist_width,
+        left=0,
+        fill_color="gray",
+        line_color="gray",
+    )
+    p_right.xaxis.axis_label = pdata.y.hist_label_prefix
+    p_right.yaxis.visible = False
+
+    return gridplot(
+        [
+            [p_top, None],
+            [fig_joint, p_right],
+        ],
+        merge_tools=True,
+        toolbar_location="left",
+    )

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+
+from bokeh.core.enums import SizingModeType
 import numpy as np
-from bokeh.layouts import gridplot
+from bokeh.layouts import column, gridplot, row
 from bokeh.models import (
     ColumnDataSource,
-    GridPlot,
+    LayoutDOM,
     LinearColorMapper,
     ColorBar,
+    Spacer,
 )
-from bokeh.palettes import Viridis256
+from bokeh.palettes import Palette, Viridis256
 
 from bokeh.plotting import figure
 
@@ -29,7 +32,11 @@ def marginal_plot(
     width: int = 600,
     height: int = 600,
     colorbar: bool = False,
-) -> GridPlot:
+    sizing_mode: SizingModeType | None = None,
+    x_label_orientation: float | None = np.pi / 4,
+    marginal_fraction: float = 0.2,
+    palette: Palette = Viridis256,
+) -> LayoutDOM:
     """
     Density plot and projections with bokeh.
 
@@ -51,14 +58,23 @@ def marginal_plot(
     tex: bool, default = True
         Use TEX for labels
     nice: bool, default = True
-
+        Use "nice" prefixes.
     ellipse: bool, default = True
-        If True, plot an ellipse representing the
-        2x2 sigma matrix
+        If True, plot an ellipse representing the 2x2 sigma matrix.
+    sizing_mode: str, default = None
+        Bokeh sizing mode for responsive layout.  When set (e.g.
+        ``"stretch_width"``), the layout uses ``row``/``column`` instead of
+        ``gridplot`` so that the marginal histograms scale correctly with the
+        main figure.
+        By default (None), a fixed-size ``GridPlot`` is returned.
+    marginal_fraction : float, default = 0.2
+        Fraction of the plot to use for the marginal plots.
+    palette : bokeh.palettes.Palette, default=Viridis256
+        Color map.
 
     Returns
     -------
-    GridPlot
+    LayoutDOM
 
     Examples
     --------
@@ -82,11 +98,10 @@ def marginal_plot(
     labely = mathlabel(key2, units=pdata.y.full_unit, tex=False).replace("$", "")
 
     # Layout Sizes
-    marg_fraction = 0.2
-    main_w = int(width * (1 - marg_fraction))
-    main_h = int(height * (1 - marg_fraction))
-    marg_w = int(width * marg_fraction)
-    marg_h = int(height * marg_fraction)
+    main_w = int(width * (1 - marginal_fraction))
+    main_h = int(height * (1 - marginal_fraction))
+    marg_w = int(width * marginal_fraction)
+    marg_h = int(height * marginal_fraction)
 
     # Main Joint Figure
     fig_joint = figure(
@@ -111,7 +126,7 @@ def marginal_plot(
         h_min = np.min(H[H > 0]) if np.any(H > 0) else 0
         h_max = np.max(H) if np.any(H) else 1
 
-        mapper = LinearColorMapper(palette=Viridis256, low=h_min, high=h_max)
+        mapper = LinearColorMapper(palette=palette, low=h_min, high=h_max)
 
         if colorbar:
             color_bar = ColorBar(color_mapper=mapper, location=(0, 0))
@@ -137,9 +152,13 @@ def marginal_plot(
             color_mapper=mapper,
         )
 
-    if pdata.ellipse_x is not None:
+    if pdata.ellipse_x is not None and pdata.ellipse_y is not None:
         fig_joint.line(
-            pdata.ellipse_x, pdata.ellipse_y, color="red", line_width=2, alpha=0.8
+            pdata.ellipse_x,
+            pdata.ellipse_y,
+            color="red",
+            line_width=2,
+            alpha=0.8,
         )
 
     # Marginal Plots
@@ -185,6 +204,28 @@ def marginal_plot(
     )
     p_right.xaxis.axis_label = pdata.y.hist_label_prefix
     p_right.yaxis.visible = False
+
+    plots = [p_right, p_top, fig_joint]
+    if x_label_orientation is not None:
+        for plot in plots:
+            plot.xaxis.major_label_orientation = x_label_orientation
+    for plot in plots:
+        plot.toolbar.logo = None
+
+    if sizing_mode is not None:
+        fig_joint.sizing_mode = "scale_width"
+        fig_joint.aspect_ratio = main_h / main_w
+        p_top.sizing_mode = "stretch_width"
+        p_right.sizing_mode = "stretch_height"
+
+        left_col = column(p_top, fig_joint, sizing_mode=sizing_mode)
+        right_col = column(
+            Spacer(width=marg_w, height=marg_h),
+            p_right,
+            sizing_mode="stretch_height",
+            width=marg_w,
+        )
+        return row(left_col, right_col, sizing_mode=sizing_mode)
 
     return gridplot(
         [

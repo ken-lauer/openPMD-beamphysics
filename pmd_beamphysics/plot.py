@@ -375,19 +375,8 @@ def marginal_plot(
     labelx = mathlabel(key1, units=pdata.x.full_unit, tex=tex)
     labely = mathlabel(key2, units=pdata.y.full_unit, tex=tex)
 
-    if pdata.x.unit_symbol == "s":
-        _, hist_prefix = nice_scale_prefix(
-            pdata.x.hist_unit_factor / pdata.x.unit_factor
-        )
-        ax_marg_x.set_ylabel(f"{hist_prefix}A")
-    else:
-        ax_marg_x.set_ylabel(
-            pdata.x.hist_label_prefix + mathlabel(f"C/{pdata.x.full_unit}")
-        )
-
-    ax_marg_y.set_xlabel(
-        pdata.y.hist_label_prefix + mathlabel(f"C/{pdata.y.full_unit}")
-    )
+    ax_marg_x.set_ylabel(pdata.x.axis_label)
+    ax_marg_y.set_xlabel(pdata.y.axis_label)
 
     # Turn off tick labels on marginals
     plt.setp(ax_marg_x.get_xticklabels(), visible=False)

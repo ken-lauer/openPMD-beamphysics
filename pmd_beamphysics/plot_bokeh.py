@@ -19,6 +19,15 @@ from .labels import mathlabel
 from .plot_base import prepare_marginal_plot
 
 
+def mathjax_fix(label: str) -> str:
+    """
+    Adjust the Matplotlib-style LaTeX label for bokeh/MathJax.
+    """
+    label = label.replace("µ", r" \mu ")
+    label = label.replace("$", "$$")
+    return label
+
+
 def marginal_plot(
     particle_group,
     key1: str = "t",
@@ -34,8 +43,9 @@ def marginal_plot(
     colorbar: bool = False,
     sizing_mode: SizingModeType | None = None,
     x_label_orientation: float | None = np.pi / 4,
-    marginal_fraction: float = 0.2,
+    marginal_fraction: float = 0.33,
     palette: Palette = Viridis256,
+    low_color: str = "#ffffff00",
 ) -> LayoutDOM:
     """
     Density plot and projections with bokeh.
@@ -94,12 +104,12 @@ def marginal_plot(
         ellipse=ellipse,
     )
 
-    labelx = mathlabel(key1, units=pdata.x.full_unit, tex=False).replace("$", "")
-    labely = mathlabel(key2, units=pdata.y.full_unit, tex=False).replace("$", "")
+    labelx = mathlabel(key1, units=pdata.x.full_unit, tex=False)
+    labely = mathlabel(key2, units=pdata.y.full_unit, tex=False)
 
     # Layout Sizes
-    main_w = int(width * (1 - marginal_fraction))
-    main_h = int(height * (1 - marginal_fraction))
+    main_w = int(width * (1.0 - marginal_fraction))
+    main_h = int(height * (1.0 - marginal_fraction))
     marg_w = int(width * marginal_fraction)
     marg_h = int(height * marginal_fraction)
 
@@ -126,7 +136,12 @@ def marginal_plot(
         h_min = np.min(H[H > 0]) if np.any(H > 0) else 0
         h_max = np.max(H) if np.any(H) else 1
 
-        mapper = LinearColorMapper(palette=palette, low=h_min, high=h_max)
+        mapper = LinearColorMapper(
+            palette=palette,
+            low=h_min,
+            high=h_max,
+            low_color=low_color,
+        )
 
         if colorbar:
             color_bar = ColorBar(color_mapper=mapper, location=(0, 0))
@@ -181,7 +196,8 @@ def marginal_plot(
         fill_color="gray",
         line_color="gray",
     )
-    p_top.yaxis.axis_label = pdata.x.hist_label_prefix
+    p_top.yaxis.axis_label = mathjax_fix(pdata.x.axis_label)
+    # p_top.yaxis.axis_label_orientation = ...
     p_top.xaxis.visible = False
 
     # Right (Y projection)
@@ -202,7 +218,8 @@ def marginal_plot(
         fill_color="gray",
         line_color="gray",
     )
-    p_right.xaxis.axis_label = pdata.y.hist_label_prefix
+    p_right.xaxis.axis_label = mathjax_fix(pdata.y.axis_label)
+    # p_right.xaxis.axis_label_orientation = ...
     p_right.yaxis.visible = False
 
     plots = [p_right, p_top, fig_joint]

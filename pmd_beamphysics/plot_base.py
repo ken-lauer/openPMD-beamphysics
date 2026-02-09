@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from .labels import mathlabel
 from .statistics import twiss_ellipse_points
-from .units import nice_array, plottable_array
+from .units import nice_array, nice_scale_prefix, plottable_array
 
 if TYPE_CHECKING:
     from .particles import ParticleGroup
@@ -42,6 +43,13 @@ class MarginalAxisData:
     def full_unit(self) -> str:
         """Returns the combined scale prefix and root symbol, e.g. 'mm'"""
         return f"{self.unit_prefix}{self.unit_symbol}"
+
+    @property
+    def axis_label(self) -> str:
+        if self.unit_symbol == "s":
+            _, hist_prefix = nice_scale_prefix(self.hist_unit_factor / self.unit_factor)
+            return f"{hist_prefix}A"
+        return self.hist_label_prefix + mathlabel(f"C/{self.full_unit}")
 
 
 @dataclass

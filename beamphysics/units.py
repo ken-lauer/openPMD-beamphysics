@@ -7,9 +7,9 @@ For more advanced units, use a package like Pint:
 
 from __future__ import annotations
 
+import ast
 import copy
 import math
-import re
 import unicodedata
 import warnings
 from typing import Optional, Sequence
@@ -47,6 +47,218 @@ _HOMOGLYPH_TRANSLATION = str.maketrans({"μ": "µ"})
 # Module-level dict that will be populated after NAMED_UNITS is created
 # This avoids the globals() check chicken-and-egg problem
 known_unit: dict[str, "pmd_unit"] = {}
+
+
+# ---------------------------------------------------------------------------
+# AST-based parser
+# ---------------------------------------------------------------------------
+# Unit symbols share a tiny grammar with Python expression syntax once "^" is
+# rewritten to "**". Delegating the structural parse to ``ast.parse`` lets us
+# skip writing a tokenizer, paren-balance checker, and precedence resolver --
+# only the domain layer (lookup, SI-prefix fallback, homoglyph and legacy-name
+# substitution) is still ours to maintain.
+
+# Legacy known-unit names that aren't valid Python identifiers ("charge #"
+# contains both whitespace and "#", which starts a Python comment). After
+# whitespace stripping in ``_parse_unit_ast`` "charge #" arrives here as
+# "charge#"; we swap it to its existing identifier alias before ``ast.parse``.
+# The inverse map restores the canonical legacy spelling in the emitted
+# symbol so callers see "charge #/m", not "charge_num/m".
+_PY_SAFE_NAMES: dict[str, str] = {"charge#": "charge_num"}
+_PY_SAFE_INVERSE: dict[str, str] = {"charge_num": "charge #"}
+
+_BINOP_SYM = {ast.Mult: "*", ast.Div: "/", ast.Pow: "^"}
+
+
+def _parse_unit_ast(symbol: str) -> ast.AST:
+    """Parse a unit symbol into an ast.AST.
+
+    Strips all whitespace, rewrites "^" to "**", and substitutes
+    non-identifier legacy names so ``ast.parse`` can tokenize the result.
+    Raises ``ValueError`` on syntactic failure -- callers that want to
+    distinguish "no symbol" from "bad symbol" should handle the empty case
+    themselves before calling.
+    """
+    s = "".join(symbol.split()).replace("^", "**")
+    for orig, safe in _PY_SAFE_NAMES.items():
+        s = s.replace(orig, safe)
+    try:
+        return ast.parse(s, mode="eval").body
+    except SyntaxError as exc:
+        raise ValueError(f"Malformed unit symbol {symbol!r}: {exc.msg}") from None
+
+
+def _eval_exponent(node: ast.AST) -> float:
+    """Reduce the right side of ``**`` to a number.
+
+    Accepts integer/float literals, unary minus, and integer/integer
+    fractions (so ``m^(-3/2)`` resolves). Anything richer is malformed.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_exponent(node.operand)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _eval_exponent(node.left) / _eval_exponent(node.right)
+    raise ValueError(f"Unsupported exponent expression: {ast.unparse(node)}")
+
+
+def _resolve_atom(name: str, cls: type) -> "pmd_unit":
+    """Look up a bare identifier as a known unit, with SI-prefix fallback.
+
+    Handles two ast-induced wrinkles:
+    - ``ast.parse`` NFKC-normalizes identifier text, mapping the micro sign
+      "µ" (U+00B5) onto Greek mu "μ" (U+03BC). Re-apply ``_HOMOGLYPH_TRANSLATION``
+      so the SHORT_PREFIX_FACTOR key still matches.
+    - Names rewritten by ``_PY_SAFE_NAMES`` (e.g. ``"charge_num"`` standing in
+      for ``"charge #"``) get their legacy spelling restored for the stored
+      symbol via ``_PY_SAFE_INVERSE``.
+    """
+    name = name.translate(_HOMOGLYPH_TRANSLATION)
+    display = _PY_SAFE_INVERSE.get(name, name)
+
+    if name in known_unit:
+        result = copy.copy(known_unit[name])
+        result._unitSymbol = display
+        return result
+
+    # Longest prefix first so "da" (deca) wins over "d" (deci), matching the
+    # inverse of simplify()'s emitted forms.
+    for prefix in sorted(SHORT_PREFIX_FACTOR, key=len, reverse=True):
+        if not prefix or not name.startswith(prefix):
+            continue
+        remainder = name[len(prefix) :]
+        if remainder in ("", "1") or remainder not in known_unit:
+            continue
+        base = known_unit[remainder]
+        factor = SHORT_PREFIX_FACTOR[prefix]
+        return cls(display, factor * base.unitSI, base.unitDimension)
+
+    raise ValueError(f"Unknown unitSymbol: {name}")
+
+
+def _eval_unit_ast(node: ast.AST, cls: type) -> "pmd_unit":
+    """Build a pmd_unit from a parsed unit AST.
+
+    The returned unit's stored symbol comes from ``_emit_unit`` on the same
+    node, so the spelling reflects the input's structural shape (with
+    redundant parens dropped) rather than the symbol that ``multiply_units``
+    or ``power_unit`` would assemble from scratch.
+    """
+    if isinstance(node, ast.Name):
+        return _resolve_atom(node.id, cls)
+
+    if isinstance(node, ast.Constant):
+        # Only "1" as a top-level unit is meaningful (the dimensionless
+        # identity). Numbers elsewhere appear inside exponents and never
+        # reach this branch.
+        if node.value == 1:
+            return cls("", 1.0, _DIMENSIONLESS)
+        raise ValueError(f"Bare numeric literal is not a unit: {node.value!r}")
+
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Mult):
+            result = _eval_unit_ast(node.left, cls) * _eval_unit_ast(node.right, cls)
+        elif isinstance(node.op, ast.Div):
+            result = _eval_unit_ast(node.left, cls) / _eval_unit_ast(node.right, cls)
+        elif isinstance(node.op, ast.Pow):
+            base = _eval_unit_ast(node.left, cls)
+            result = power_unit(base, _eval_exponent(node.right))
+        else:
+            raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        result._unitSymbol = _emit_unit(node)
+        return result
+
+    if isinstance(node, ast.Call):
+        # The only recognized call shape is sqrt(<expr>). Bare "(a)(b)"
+        # parses as Call(Name('a'), [Name('b')]) and is rejected here.
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "sqrt"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            inner = _eval_unit_ast(node.args[0], cls)
+            result = power_unit(inner, 0.5)
+            result._unitSymbol = f"sqrt({inner.unitSymbol})"
+            return result
+        raise ValueError(f"Unsupported call expression: {ast.unparse(node)}")
+
+    raise ValueError(f"Unsupported unit expression: {ast.unparse(node)}")
+
+
+def _emit_unit(node: ast.AST) -> str:
+    """Re-serialize a parsed unit AST to its canonical symbol string.
+
+    Parenthesization is the minimum the structure requires: ``V/(m)``
+    collapses to ``V/m``, ``V/(eV/c)`` keeps its parens (left-associativity
+    of "/" makes the two trees distinguishable), and ``(eV*s)^2`` wraps the
+    compound base.
+    """
+    if isinstance(node, ast.Name):
+        ident = node.id.translate(_HOMOGLYPH_TRANSLATION)
+        return _PY_SAFE_INVERSE.get(ident, ident)
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, float) and v == int(v):
+            return str(int(v))
+        return str(v)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return "-" + _emit_unit(node.operand)
+    if isinstance(node, ast.BinOp):
+        op = _BINOP_SYM[type(node.op)]
+        left = _emit_unit(node.left)
+        right = _emit_unit(node.right)
+        if op in ("*", "/"):
+            if isinstance(node.right, ast.BinOp) and isinstance(
+                node.right.op, (ast.Mult, ast.Div)
+            ):
+                right = f"({right})"
+            return f"{left}{op}{right}"
+        # op == "^": parenthesize a compound base ((eV*s)^2) and a Div-shaped
+        # exponent (m^(-3/2)).
+        if isinstance(node.left, ast.BinOp) and isinstance(
+            node.left.op, (ast.Mult, ast.Div)
+        ):
+            left = f"({left})"
+        if isinstance(node.right, ast.BinOp) and isinstance(node.right.op, ast.Div):
+            right = f"({right})"
+        return f"{left}^{right}"
+    if isinstance(node, ast.Call):
+        return f"sqrt({_emit_unit(node.args[0])})"
+    raise ValueError(f"Cannot serialize node: {ast.unparse(node)}")
+
+
+def _exp_to_node(exp: float) -> ast.AST:
+    """Build a Constant node for an exponent, using an int when exact."""
+    if exp == int(exp):
+        return ast.Constant(value=int(exp))
+    return ast.Constant(value=exp)
+
+
+def _wrap_power(base: ast.AST, exp: float) -> ast.AST:
+    """Return ``base ** exp`` as an AST; pass through unchanged if exp == 1."""
+    if exp == 1:
+        return base
+    return ast.BinOp(left=base, op=ast.Pow(), right=_exp_to_node(exp))
+
+
+def _multiply_powers(node: ast.AST, factor: float) -> ast.AST:
+    """Distribute ``factor`` across every per-token exponent in ``node``.
+
+    ``(eV*s)^2`` -> ``eV^2*s^2``; an existing ``m^2`` raised to ``3`` becomes
+    ``m^6``. Used by ``power_unit`` to compose ``(symbol)^factor`` without
+    re-parsing intermediate strings.
+    """
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Div)):
+        return ast.BinOp(
+            left=_multiply_powers(node.left, factor),
+            op=node.op,
+            right=_multiply_powers(node.right, factor),
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+        return _wrap_power(node.left, _eval_exponent(node.right) * factor)
+    return _wrap_power(node, factor)
 
 
 class pmd_unit:
@@ -181,18 +393,20 @@ class pmd_unit:
         """
         Create a pmd_unit from a symbol string, with automatic lookup and parsing.
 
-        This is the single, recursive parser. It handles:
+        Handles:
 
         - Known units ('eV', 'm', 'T') and aliases ('Ohm', 'deg')
-        - Compound expressions ('eV/c', 'kg*m/s') — each token recurses here
+        - Compound expressions ('eV/c', 'kg*m/s')
         - Parenthesized grouping ('V/(eV/c)', '(eV*s)^2')
         - Power notation ('m^2', 's^-1', 'm^(-3/2)')
         - Square root notation ('sqrt(m)', 'sqrt(kg*m)')
         - SI-prefixed known units ('keV', 'mm', 'mrad')
 
-        Every recursive call parses a strictly shorter string (a token, a
-        sqrt/group inner expression, or a power base) — never the unchanged
-        input — so parsing always terminates.
+        Structural parsing is delegated to ``ast.parse`` after preprocessing
+        (NFC + homoglyph normalization, whitespace stripped, "^" rewritten to
+        "**", non-identifier legacy keys substituted). The domain-layer
+        rules -- lookup priority, SI-prefix fallback, side-effect-free copy
+        of cached units -- live in ``_eval_unit_ast`` / ``_resolve_atom``.
 
         Parameters
         ----------
@@ -209,150 +423,37 @@ class pmd_unit:
         ValueError
             If the symbol is not found in known_unit dict or cannot be parsed.
         """
-        # Canonicalize the input:
-        #
-        # - Look-alike Unicode characters are converted to the ones the
-        #   unit tables use, so a pasted Ω or µ parses no matter which of
-        #   its visually identical twins it actually is. NFC normalization
-        #   handles the ohm/omega pair; _HOMOGLYPH_TRANSLATION handles
-        #   Greek mu vs the micro sign (see its definition for details).
-        # - Outer whitespace and whitespace around "^" are stripped, so
-        #   "  eV/c", "kg*m / s", and "m ^ 2" parse like their tight forms.
-        #   We do not split on whitespace (no implicit space-as-*), which
-        #   would conflict with multi-token named units like "charge #" and
-        #   with the SI-prefix fallback ("k eV" vs "keV").
-        unitSymbol = re.sub(
-            r"\s*\^\s*",
-            "^",
-            unicodedata.normalize("NFC", unitSymbol)
-            .translate(_HOMOGLYPH_TRANSLATION)
-            .strip(),
+        # Look-alike Unicode characters are converted to the ones the unit
+        # tables use, so a pasted Ω or µ parses no matter which of its
+        # visually identical twins it actually is. NFC normalization handles
+        # the ohm/omega pair; _HOMOGLYPH_TRANSLATION handles Greek mu vs the
+        # micro sign (see its definition for details). All whitespace is
+        # then dropped: outer, around operators, AND inside tokens. "k eV"
+        # becomes "keV" (1000 eV), which is a deliberate expansion over the
+        # old "no internal whitespace inside a token" rule.
+        normalized = unicodedata.normalize("NFC", unitSymbol).translate(
+            _HOMOGLYPH_TRANSLATION
         )
+        normalized = "".join(normalized.split())
 
-        # Check if known_unit dict has been populated
         if not known_unit:
             raise ValueError(
-                f"Cannot lookup unitSymbol '{unitSymbol}': known_unit dict not yet initialized. "
+                f"Cannot lookup unitSymbol '{normalized}': known_unit dict not yet initialized. "
                 "Use pmd_unit(unitSymbol, unitSI, unitDimension) with explicit parameters instead."
             )
 
-        # Known unit (or alias) lookup has priority. Return a shallow copy,
-        # never the shared cached object: callers reassign ``_unitSymbol`` on
-        # the result, which would otherwise mutate the global NAMED_UNITS
-        # entry. (All three slots are immutable: str, float, tuple.)
-        if unitSymbol in known_unit:
-            result = copy.copy(known_unit[unitSymbol])
-            result._unitSymbol = unitSymbol
+        # Direct lookup wins before any structural parsing. A shallow copy
+        # keeps the shared NAMED_UNITS entry untouched when the caller (or
+        # downstream code) reassigns ``_unitSymbol`` on the result.
+        if normalized in known_unit:
+            result = copy.copy(known_unit[normalized])
+            result._unitSymbol = normalized
             return result
 
-        # Compound expression: split on top-level "*" and "/" (parentheses
-        # protect their contents) and recurse on each token.
-        parts, operators = _tokenize_compound(unitSymbol)
-        if len(parts) > 1:
-            # Reject empty operands around an operator ("m*", "/m", "m**s").
-            if any(p == "" for p in parts):
-                raise ValueError(
-                    f"Malformed unit symbol {unitSymbol!r}: empty operand around an operator."
-                )
+        if normalized in ("", "1"):
+            return cls("", 1.0, _DIMENSIONLESS)
 
-            token_units = [cls.from_symbol(p) for p in parts]
-            result = token_units[0]
-            for op, unit_obj in zip(operators, token_units[1:]):
-                if op == "*":
-                    result = result * unit_obj
-                elif op == "/":
-                    result = result / unit_obj
-
-            # Canonical symbol: stripped tokens joined by the original
-            # operators with no whitespace. So "eV / c" and "eV/c" share a
-            # symbol (and therefore compare equal / hash identically). A
-            # parenthesized token is re-emitted from its parsed unit, so
-            # "( eV / c )" canonicalizes to "(eV/c)" — and the parens are
-            # dropped entirely when the group is atomic ("(m)" -> "m").
-            canonical_parts = []
-            for p, u in zip(parts, token_units):
-                if p.startswith("(") and p.endswith(")") and _parens_balanced(p[1:-1]):
-                    s = u.unitSymbol
-                    canonical_parts.append(s if _is_atomic_symbol(s) else f"({s})")
-                else:
-                    canonical_parts.append(p)
-            result._unitSymbol = _join_compound(canonical_parts, operators)
-            return result
-
-        # --- Single token from here on. ---
-
-        # sqrt() notation: sqrt(X) = X^0.5. The stored symbol is always the
-        # canonical, whitespace-free "sqrt(<inner>)" form so that "sqrt( m )"
-        # and "sqrt(m)" compare equal and hash identically. The
-        # balanced-parens guard keeps a product like "sqrt(m)*sqrt(m)" (whose
-        # final ")" is not the partner of the first "(") from being consumed
-        # as one sqrt.
-        sqrt_match = re.match(r"^sqrt\(\s*(.+?)\s*\)$", unitSymbol)
-        if sqrt_match and _parens_balanced(sqrt_match.group(1)):
-            base_unit = cls.from_symbol(sqrt_match.group(1))
-            result = power_unit(base_unit, 0.5)
-            result._unitSymbol = f"sqrt({base_unit.unitSymbol})"
-            return result
-
-        # Parenthesized grouping: "(eV/c)" parses the inner expression as a
-        # unit of its own, so "V/(eV/c)" divides by the whole group and
-        # "(eV*s)^2" exponentiates it (via the power branches below, whose
-        # base recursion lands back here). The balanced-parens guard keeps
-        # adjacent groups with no operator, like "(a)(b)", from matching as
-        # one group with inner "a)(b".
-        paren_group_match = re.match(r"^\((.+)\)$", unitSymbol)
-        if paren_group_match and _parens_balanced(paren_group_match.group(1)):
-            result = cls.from_symbol(paren_group_match.group(1))
-            # Preserve the grouping in the stored symbol unless it is
-            # redundant: "(eV/c)" stays, "(m)" canonicalizes to "m".
-            s = result.unitSymbol
-            if not _is_atomic_symbol(s):
-                result._unitSymbol = f"({s})"
-            return result
-
-        # Power notation with a parenthesized fraction: m^(-3/2)
-        paren_power_match = re.match(r"^(.+)\^\((-?\d+)/(\d+)\)$", unitSymbol)
-        if paren_power_match:
-            power = int(paren_power_match.group(2)) / int(paren_power_match.group(3))
-            base_unit = cls.from_symbol(paren_power_match.group(1))
-            result = power_unit(base_unit, power)
-            # Preserve the user's spelling ("m^(1/2)", not "m^0.5").
-            result._unitSymbol = unitSymbol
-            return result
-
-        # Power notation: m^2, m^-1, m^0.5 (the base recurses, so sqrt(m)^2
-        # and (eV*s)^2 work)
-        power_match = re.match(r"^(.+)\^(-?\d+(?:\.\d+)?)$", unitSymbol)
-        if power_match:
-            base_unit = cls.from_symbol(power_match.group(1))
-            result = power_unit(base_unit, float(power_match.group(2)))
-            # Preserve the user's spelling ("(eV*s)^2", not the distributed
-            # "eV^2*s^2" that power_unit emits).
-            result._unitSymbol = unitSymbol
-            return result
-
-        # SI-prefix fallback: e.g. "keV" -> kilo + "eV", "mm" -> milli + "m",
-        # "mrad" -> milli + "rad". Only matches when the remainder is itself a
-        # known unit; a bare prefix ("k", "M") or a prefixed dimensionless
-        # identity ("k1") is not a valid unit. Longest prefixes first so "da"
-        # (deca) wins over "d" (deci). This is the inverse of the prefixed
-        # symbols simplify() emits, so those always round-trip.
-        for prefix in sorted(SHORT_PREFIX_FACTOR, key=len, reverse=True):
-            if prefix == "" or not unitSymbol.startswith(prefix):
-                continue
-            remainder = unitSymbol[len(prefix) :]
-            if remainder in ("", "1") or remainder not in known_unit:
-                continue
-            base = known_unit[remainder]
-            factor = SHORT_PREFIX_FACTOR[prefix]
-            return cls(
-                unitSymbol,
-                unitSI=factor * base.unitSI,
-                unitDimension=base.unitDimension,
-            )
-
-        # Unknown unit
-        raise ValueError(f"Unknown unitSymbol: {unitSymbol}")
+        return _eval_unit_ast(_parse_unit_ast(normalized), cls)
 
     def __hash__(self) -> int:
         # The openPMD standard defines a unit by its dimension and conversion
@@ -604,52 +705,56 @@ class pmd_unit:
 
 
 def _symbol_to_tex(symbol: str) -> str:
-    """Recursive worker for :meth:`pmd_unit.to_tex`."""
-    if symbol == "":
-        return ""
-    if symbol == "1":
-        return "1"
+    """Recursive worker for :meth:`pmd_unit.to_tex`.
 
-    # Top-level compound (``a*b``, ``a/b``, ``sqrt(a)*b``). Tokenize first so
-    # the recursion handles nested ``sqrt(...)`` and per-token powers.
-    if "*" in symbol or "/" in symbol:
-        parts, operators = _tokenize_compound(symbol)
-        if len(parts) > 1:
-            tex_parts = [_symbol_to_tex(p) for p in parts]
-            out = tex_parts[0]
-            for op, p in zip(operators, tex_parts[1:]):
-                out += r"{\cdot}" + p if op == "*" else "/" + p
-            return out
+    Reuses the unit AST so the grammar shared with :meth:`from_symbol`
+    (compound, paren-group, sqrt, power) is parsed once and walked into TeX.
+    """
+    if symbol in ("", "1"):
+        return symbol
+    return _emit_tex(_parse_unit_ast(symbol))
 
-    # sqrt(X) -> \sqrt{ <recursed X> }
-    sqrt_match = re.match(r"^sqrt\((.+)\)$", symbol)
-    if sqrt_match:
-        inner = _symbol_to_tex(sqrt_match.group(1))
-        return rf"\sqrt{{{inner}}}"
 
-    # Parenthesized group: "(X)" -> ( <recursed X> ). The balanced guard
-    # mirrors the parser's, so "(a)(b)" falls through to the atomic fallback
-    # rather than matching as one group.
-    paren_group_match = re.match(r"^\((.+)\)$", symbol)
-    if paren_group_match and _parens_balanced(paren_group_match.group(1)):
-        return "(" + _symbol_to_tex(paren_group_match.group(1)) + ")"
-
-    # base^(n/d) -> \mathrm{base}^{n/d}
-    paren_power_match = _TOKEN_PAREN_POWER_RE.match(symbol)
-    if paren_power_match:
-        base = _symbol_to_tex(paren_power_match.group(1))
-        num = paren_power_match.group(2)
-        den = paren_power_match.group(3)
-        return rf"{base}^{{{num}/{den}}}"
-
-    # base^N -> \mathrm{base}^{N}
-    power_match = _TOKEN_POWER_RE.match(symbol)
-    if power_match:
-        base = _symbol_to_tex(power_match.group(1))
-        return f"{base}^{{{power_match.group(2)}}}"
-
-    # Atomic name (possibly with internal whitespace, e.g. "charge #").
-    return rf"\mathrm{{{symbol}}}"
+def _emit_tex(node: ast.AST) -> str:
+    """Render a parsed unit AST as a matplotlib-mathtext fragment."""
+    if isinstance(node, ast.Name):
+        ident = node.id.translate(_HOMOGLYPH_TRANSLATION)
+        ident = _PY_SAFE_INVERSE.get(ident, ident)
+        return rf"\mathrm{{{ident}}}"
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, float) and v == int(v):
+            return str(int(v))
+        return str(v)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return "-" + _emit_tex(node.operand)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Mult):
+            return _emit_tex(node.left) + r"{\cdot}" + _emit_tex(node.right)
+        if isinstance(node.op, ast.Div):
+            right = _emit_tex(node.right)
+            # Parenthesize a Mult/Div divisor for readability: a/(b/c)
+            # renders as "a/(b/c)", not "a/b/c".
+            if isinstance(node.right, ast.BinOp) and isinstance(
+                node.right.op, (ast.Mult, ast.Div)
+            ):
+                right = f"({right})"
+            return _emit_tex(node.left) + "/" + right
+        if isinstance(node.op, ast.Pow):
+            base = _emit_tex(node.left)
+            if isinstance(node.left, ast.BinOp) and isinstance(
+                node.left.op, (ast.Mult, ast.Div)
+            ):
+                base = f"({base})"
+            exp_node = node.right
+            if isinstance(exp_node, ast.BinOp) and isinstance(exp_node.op, ast.Div):
+                exp = f"{_emit_tex(exp_node.left)}/{_emit_tex(exp_node.right)}"
+            else:
+                exp = _emit_tex(exp_node)
+            return f"{base}^{{{exp}}}"
+    if isinstance(node, ast.Call):
+        return rf"\sqrt{{{_emit_tex(node.args[0])}}}"
+    raise ValueError(f"Cannot TeX-serialize node: {ast.unparse(node)}")
 
 
 def is_dimensionless(u: pmd_unit) -> bool:
@@ -703,60 +808,22 @@ def _canonical_unitSI(unitSI: float) -> float:
     return float(f"{unitSI:.{_UNITSI_SIG_FIGS - 1}e}")
 
 
-def _tokenize_compound(symbol: str) -> tuple[list[str], list[str]]:
-    """Split ``symbol`` on top-level ``*`` and ``/`` (respecting parentheses).
-
-    Returns ``(parts, operators)`` where each part is whitespace-stripped and
-    ``operators[i]`` joins ``parts[i]`` to ``parts[i+1]``. Used by both the
-    parser and :func:`power_unit` (for distributing an exponent across a
-    compound symbol).
-    """
-    parts: list[str] = []
-    operators: list[str] = []
-    current = ""
-    paren_depth = 0
-    for char in symbol:
-        if char == "(":
-            paren_depth += 1
-            current += char
-        elif char == ")":
-            paren_depth -= 1
-            current += char
-        elif char in "*/" and paren_depth == 0:
-            parts.append(current)
-            operators.append(char)
-            current = ""
-        else:
-            current += char
-    parts.append(current)
-    return [p.strip() for p in parts], operators
-
-
-def _parens_balanced(symbol: str) -> bool:
-    """True if parentheses in ``symbol`` are balanced and never close early."""
-    depth = 0
-    for char in symbol:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
-
-
-def _join_compound(parts: Sequence[str], operators: Sequence[str]) -> str:
-    """Inverse of :func:`_tokenize_compound`: re-emit a compound symbol."""
-    out = parts[0]
-    for op, p in zip(operators, parts[1:]):
-        out += op + p
-    return out
-
-
 def _is_atomic_symbol(symbol: str) -> bool:
-    """True if the symbol has no top-level ``*`` or ``/`` (parens are kept)."""
-    parts, _ = _tokenize_compound(symbol)
-    return len(parts) == 1
+    """True if the symbol has no top-level ``*`` or ``/``.
+
+    Atomic in this sense means "no top-level product or quotient" -- a Name,
+    a power, a sqrt, or a paren-wrapped compound all count as atomic for the
+    callers (``divide_units`` and ``_best_compound_match``).
+    """
+    if not symbol:
+        return True
+    try:
+        root = _parse_unit_ast(symbol)
+    except ValueError:
+        return False
+    return not (
+        isinstance(root, ast.BinOp) and isinstance(root.op, (ast.Mult, ast.Div))
+    )
 
 
 def _symbol_complexity(symbol: str) -> tuple[int, int, str]:
@@ -1021,63 +1088,18 @@ def power_unit(u: pmd_unit, power: float) -> pmd_unit:
         raise ValueError("`u` is not a pmd_unit instance")
 
     symbol = u.unitSymbol
-    if symbol in ["", "1"]:
+    if symbol in ("", "1"):
         new_symbol = symbol
-    elif "*" in symbol or "/" in symbol:
-        # Distribute the exponent across the tokens of a compound symbol:
-        # (eV*s)^2 -> "eV^2*s^2". The distributed form is the conventional
-        # spelling and composes with existing per-token exponents.
-        new_symbol = _distribute_power_in_symbol(symbol, power)
     else:
-        new_symbol = _format_power(symbol, power)
+        # Distribute the exponent across every per-token exponent in the
+        # symbol's AST: ``(eV*s)^2`` -> ``eV^2*s^2``; ``m^(1/2)^2`` -> ``m``.
+        # An atomic base ``m`` simply wraps to ``m^power``.
+        new_symbol = _emit_unit(_multiply_powers(_parse_unit_ast(symbol), power))
 
     unitSI = u.unitSI**power
     dim = tuple(d * power for d in u.unitDimension)
 
     return pmd_unit(new_symbol, unitSI=unitSI, unitDimension=dim)
-
-
-_TOKEN_PAREN_POWER_RE = re.compile(r"^(.+)\^\((-?\d+)/(\d+)\)$")
-_TOKEN_POWER_RE = re.compile(r"^(.+)\^(-?\d+(?:\.\d+)?)$")
-
-
-def _format_power(base: str, power: float) -> str:
-    """Render ``base^power`` with an integer exponent where possible."""
-    if power == 1:
-        return base
-    if power == int(power):
-        return f"{base}^{int(power)}"
-    return f"{base}^{power}"
-
-
-def _combine_token_power(token: str, factor: float) -> str:
-    """Multiply a token's existing exponent by ``factor``.
-
-    ``m`` with factor 2 becomes ``m^2``; ``s^2`` with factor 2 becomes
-    ``s^4``; ``m^(1/2)`` with factor 2 becomes ``m^1`` (i.e. ``m``).
-    Unknown / nested forms (e.g. ``sqrt(m)``) are wrapped as
-    ``sqrt(m)^factor`` and resolved by the parser's recursion.
-    """
-    paren_match = _TOKEN_PAREN_POWER_RE.match(token)
-    if paren_match:
-        base = paren_match.group(1)
-        existing = int(paren_match.group(2)) / int(paren_match.group(3))
-    else:
-        power_match = _TOKEN_POWER_RE.match(token)
-        if power_match:
-            base = power_match.group(1)
-            existing = float(power_match.group(2))
-        else:
-            base = token
-            existing = 1.0
-    return _format_power(base, existing * factor)
-
-
-def _distribute_power_in_symbol(symbol: str, power: float) -> str:
-    """Distribute an exponent across a compound symbol (e.g. ``(eV*s)^2``)."""
-    parts, operators = _tokenize_compound(symbol)
-    new_parts = [_combine_token_power(p, power) for p in parts]
-    return _join_compound(new_parts, operators)
 
 
 # length mass time current temperature mol luminous
